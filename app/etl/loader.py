@@ -62,116 +62,99 @@ class CricsheetLoader:
 
     def download_and_extract(
         self,
-        max_matches: int = 200,
-        timeout: int = 30,
+        max_matches: Optional[int] = None,
+        timeout: int = 40,
     ) -> pd.DataFrame:
         """Download Cricsheet IPL zip archive and consolidate deliveries into a DataFrame."""
         logger.info("Connecting to Cricsheet to download IPL dataset: %s", self.download_url)
-        headers = {"User-Agent": "CricPredict-ML-Engine/1.0 (+https://github.com/cricpredict)"}
+        headers = {"User-Agent": "CricPredict-ML-Engine/1.0"}
         req = urllib.request.Request(self.download_url, headers=headers)
 
         with urllib.request.urlopen(req, timeout=timeout) as response:
             zip_bytes = response.read()
 
-        logger.info("Downloaded %d bytes. Parsing match zip...", len(zip_bytes))
+        logger.info("Downloaded %d bytes. Parsing match zip archive...", len(zip_bytes))
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
-            file_list = z.namelist()
-            # Match CSVs are named <match_id>.csv, info CSVs are <match_id>_info.csv
-            match_files = sorted(
-                [f for f in file_list if f.endswith(".csv") and not f.endswith("_info.csv")],
-                reverse=True,  # Take most recent matches first
-            )
+            file_list = set(z.namelist())
 
-            target_matches = match_files[:max_matches]
-            logger.info("Processing %d matches from archive...", len(target_matches))
+            # 1. Parse all match winners and metadata from info files
+            winners: Dict[int, str] = {}
+            toss_winners: Dict[int, str] = {}
+            toss_decisions: Dict[int, str] = {}
+            info_files = [f for f in file_list if f.endswith("_info.csv")]
 
-            match_dfs: List[pd.DataFrame] = []
-
-            for mf in target_matches:
-                match_id_str = mf.split(".")[0]
-                info_filename = f"{match_id_str}_info.csv"
-
-                # Extract match metadata from info file if present
-                winner = None
-                toss_winner = None
-                toss_decision = None
-                if info_filename in file_list:
-                    try:
-                        info_content = z.open(info_filename).read().decode("utf-8", errors="ignore")
-                        for line in info_content.splitlines():
-                            parts = [p.strip() for p in line.split(",")]
-                            if len(parts) >= 3 and parts[0] == "info":
-                                if parts[1] == "winner":
-                                    winner = parts[2]
-                                elif parts[1] == "toss_winner":
-                                    toss_winner = parts[2]
-                                elif parts[1] == "toss_decision":
-                                    toss_decision = parts[2]
-                    except Exception as e:
-                        logger.debug("Failed parsing info file %s: %s", info_filename, e)
-
-                # Parse ball-by-ball deliveries
+            for info_file in info_files:
                 try:
-                    df_m = pd.read_csv(z.open(mf), low_memory=False)
-                    if df_m.empty:
-                        continue
-
-                    # Standardize column naming
-                    df_m = self._normalize_match_columns(df_m, winner, toss_winner, toss_decision)
-                    match_dfs.append(df_m)
+                    match_id = int(info_file.split("_")[0])
+                    lines = z.open(info_file).read().decode("utf-8", errors="ignore").splitlines()
+                    for line in lines:
+                        parts = [p.strip() for p in line.split(",")]
+                        if len(parts) >= 3 and parts[0] == "info":
+                            if parts[1] == "winner":
+                                winners[match_id] = parts[2]
+                            elif parts[1] == "toss_winner":
+                                toss_winners[match_id] = parts[2]
+                            elif parts[1] == "toss_decision":
+                                toss_decisions[match_id] = parts[2]
                 except Exception as e:
-                    logger.debug("Error parsing match %s: %s", mf, e)
+                    logger.debug("Error parsing info file %s: %s", info_file, e)
 
-            if not match_dfs:
-                raise ValueError("No matches successfully parsed from archive.")
+            # 2. Read deliveries
+            if "all_matches.csv" in file_list:
+                df = pd.read_csv(z.open("all_matches.csv"), low_memory=False)
+            else:
+                match_files = [f for f in file_list if f.endswith(".csv") and not f.endswith("_info.csv")]
+                df = pd.concat([pd.read_csv(z.open(f), low_memory=False) for f in match_files], ignore_index=True)
 
-            combined = pd.concat(match_dfs, ignore_index=True)
-            combined = self._compute_innings_targets(combined)
-            self._save_datasets(combined)
-            return combined
+        if df.empty:
+            raise ValueError("Parsed empty dataset from Cricsheet archive.")
 
-    def _normalize_match_columns(
-        self,
-        df: pd.DataFrame,
-        winner: Optional[str] = None,
-        toss_winner: Optional[str] = None,
-        toss_decision: Optional[str] = None,
-    ) -> pd.DataFrame:
-        """Map Cricsheet columns to internal schema."""
+        # Ensure match_id is integer
+        df["match_id"] = pd.to_numeric(df["match_id"], errors="coerce").fillna(0).astype(int)
+
+        # Filter to recent matches if max_matches is set
+        if max_matches and max_matches < df["match_id"].nunique():
+            recent_ids = df["match_id"].drop_duplicates().tail(max_matches)
+            df = df[df["match_id"].isin(recent_ids)].copy()
+
+        # Map metadata
+        df["match_winner"] = df["match_id"].map(winners)
+        df["toss_winner"] = df["match_id"].map(toss_winners)
+        df["toss_decision"] = df["match_id"].map(toss_decisions)
+
+        # Standardize columns
         rename_map = {
             "striker": "batter",
             "runs_off_bat": "runs_batter",
+            "extras": "runs_extras",
             "start_date": "date",
             "wicket_type": "dismissal_type",
         }
         df = df.rename(columns=rename_map)
 
-        # Compute total runs on delivery
-        extras = df["extras"] if "extras" in df.columns else 0
-        df["runs_total"] = df["runs_batter"] + extras
+        if "runs_extras" not in df.columns:
+            df["runs_extras"] = 0
+        df["runs_extras"] = pd.to_numeric(df["runs_extras"], errors="coerce").fillna(0).astype(int)
+        df["runs_batter"] = pd.to_numeric(df["runs_batter"], errors="coerce").fillna(0).astype(int)
+        df["runs_total"] = df["runs_batter"] + df["runs_extras"]
 
-        # Over and ball
-        if "ball" in df.columns:
-            # Format in Cricsheet is float, e.g., 0.1 -> over 0, ball 1
-            df["over"] = df["ball"].astype(float).astype(int)
-            df["ball_in_over"] = ((df["ball"].astype(float) - df["over"]) * 10).round().astype(int)
-        else:
-            df["over"] = 0
-            df["ball_in_over"] = 1
+        # Handle over and ball
+        df["ball"] = pd.to_numeric(df["ball"], errors="coerce").fillna(0.0)
+        df["over"] = df["ball"].astype(int)
+        df["ball_in_over"] = ((df["ball"] - df["over"]) * 10).round().astype(int)
 
         df["venue"] = df["venue"].apply(normalize_venue)
-        df["match_winner"] = winner
-        df["toss_winner"] = toss_winner
-        df["toss_decision"] = toss_decision
-
-        # Wicket flag
+        df["season"] = df["season"].astype(str)
         df["is_wicket"] = df["player_dismissed"].notna().astype(int)
 
+        # Compute innings targets
+        df = self._compute_innings_targets(df)
+
+        self._save_datasets(df)
         return df
 
     def _compute_innings_targets(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Compute 1st innings total and assign target_runs for 2nd innings chases."""
-        # Calculate total runs per match and innings
+        """Compute 1st innings total score and assign target_runs to 2nd innings chase."""
         innings_totals = (
             df.groupby(["match_id", "innings"])["runs_total"]
             .sum()
@@ -230,7 +213,7 @@ class CricsheetLoader:
             match_id = 1400000 + match_idx
             team_a, team_b = np.random.choice(teams, size=2, replace=False)
             venue = np.random.choice(venues)
-            season = np.random.choice([2022, 2023, 2024])
+            season = str(np.random.choice([2022, 2023, 2024]))
 
             # Innings 1
             first_inn_runs = 0
@@ -244,7 +227,6 @@ class CricsheetLoader:
                     batter = np.random.choice(batters)
                     bowler = np.random.choice(bowlers)
 
-                    # Outcome distribution
                     p_wkt = 0.045 if over < 6 else (0.075 if over >= 15 else 0.04)
                     is_wkt = np.random.rand() < p_wkt
                     if is_wkt:
@@ -254,7 +236,7 @@ class CricsheetLoader:
                         dismissal = np.random.choice(["caught", "bowled", "lbw", "run out"])
                         player_dismissed = batter
                     else:
-                        runs_bat = np.random.choice([0, 1, 2, 4, 6], p=[0.38, 0.35, 0.09, 0.12, 0.06])
+                        runs_bat = int(np.random.choice([0, 1, 2, 4, 6], p=[0.38, 0.35, 0.09, 0.12, 0.06]))
                         extras = 1 if np.random.rand() < 0.05 else 0
                         dismissal = None
                         player_dismissed = None
@@ -277,7 +259,7 @@ class CricsheetLoader:
                         "bowler": bowler,
                         "non_striker": np.random.choice([b for b in batters if b != batter]),
                         "runs_batter": runs_bat,
-                        "extras": extras,
+                        "runs_extras": extras,
                         "runs_total": runs_tot,
                         "dismissal_type": dismissal,
                         "player_dismissed": player_dismissed,
@@ -290,20 +272,15 @@ class CricsheetLoader:
             chase_runs = 0
             chase_wickets = 0
             second_inn_deliveries = []
-            won = False
 
             for over in range(20):
                 for ball in range(1, 7):
-                    if chase_runs >= target_runs:
-                        won = True
-                        break
-                    if chase_wickets >= 10:
+                    if chase_runs >= target_runs or chase_wickets >= 10:
                         break
 
                     batter = np.random.choice(batters)
                     bowler = np.random.choice(bowlers)
 
-                    # Dynamic pressure
                     req_rate = (target_runs - chase_runs) / max(0.1, (120 - (over * 6 + ball)) / 6.0)
                     p_wkt = 0.05 + (0.015 if req_rate > 10 else 0.0)
                     is_wkt = np.random.rand() < p_wkt
@@ -315,7 +292,7 @@ class CricsheetLoader:
                         dismissal = np.random.choice(["caught", "bowled", "lbw", "run out"])
                         player_dismissed = batter
                     else:
-                        runs_bat = np.random.choice([0, 1, 2, 4, 6], p=[0.35, 0.36, 0.10, 0.13, 0.06])
+                        runs_bat = int(np.random.choice([0, 1, 2, 4, 6], p=[0.35, 0.36, 0.10, 0.13, 0.06]))
                         extras = 1 if np.random.rand() < 0.05 else 0
                         dismissal = None
                         player_dismissed = None
@@ -338,7 +315,7 @@ class CricsheetLoader:
                         "bowler": bowler,
                         "non_striker": np.random.choice([b for b in batters if b != batter]),
                         "runs_batter": runs_bat,
-                        "extras": extras,
+                        "runs_extras": extras,
                         "runs_total": runs_tot,
                         "dismissal_type": dismissal,
                         "player_dismissed": player_dismissed,
@@ -367,6 +344,8 @@ class CricsheetLoader:
     def _save_datasets(self, df: pd.DataFrame) -> None:
         """Persist DataFrame to CSV and Parquet formats."""
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        # Ensure object columns like season are cast to str for pyarrow
+        df["season"] = df["season"].astype(str)
         try:
             df.to_parquet(self.parquet_path, index=False)
             logger.info("Saved parquet dataset to %s", self.parquet_path)
@@ -376,7 +355,7 @@ class CricsheetLoader:
         df.to_csv(self.sample_csv_path, index=False)
         logger.info("Saved sample CSV to %s (%d rows)", self.sample_csv_path, len(df))
 
-    def load_dataset(self, force_download: bool = False, max_matches: int = 150) -> pd.DataFrame:
+    def load_dataset(self, force_download: bool = False, max_matches: Optional[int] = None) -> pd.DataFrame:
         """
         Load deliveries dataset from parquet/CSV if available, otherwise fetch
         from Cricsheet with automatic graceful fallback to synthetic generator.
@@ -392,7 +371,10 @@ class CricsheetLoader:
             if self.sample_csv_path.exists():
                 try:
                     logger.info("Loading deliveries from %s", self.sample_csv_path)
-                    return pd.read_csv(self.sample_csv_path, low_memory=False)
+                    df = pd.read_csv(self.sample_csv_path, low_memory=False)
+                    # Verify it has match_winner
+                    if "match_winner" in df.columns and df["match_winner"].notna().mean() > 0.8:
+                        return df
                 except Exception as e:
                     logger.warning("Error reading CSV file: %s", e)
 
@@ -400,7 +382,7 @@ class CricsheetLoader:
         try:
             return self.download_and_extract(max_matches=max_matches)
         except Exception as e:
-            logger.warning("Cricsheet live download failed (%s). Generating realistic dataset...", e)
+            logger.warning("Cricsheet download failed (%s). Generating realistic dataset...", e)
             return self.generate_synthetic_sample(num_matches=60)
 
 
